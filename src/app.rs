@@ -7,8 +7,10 @@ use std::path::{self, Path};
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
+#[cfg(target_os = "windows")]
 use core::time::Duration;
 
+use dirs;
 use std::sync::{Arc, Condvar, Mutex};
 
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
@@ -57,11 +59,15 @@ impl Default for TemplateApp {
         let outside_marker = Arc::new((Mutex::new(true), Condvar::new()));
         let inside_marker = Arc::clone(&outside_marker);
         let state = Arc::new(Mutex::new(State::new()));
+        let mut default_read_file = dirs::config_local_dir().unwrap();
+        default_read_file = default_read_file.parent().unwrap().to_path_buf().join("LocalLow\\ZeekerssRBLX\\Lethal Company\\Player.log");
+        let mut default_screenshot_file = dirs::picture_dir().unwrap();
+        default_screenshot_file.push("seedshot.png");
         Self {
             read_file_channel: channel(),
-            read_file_text: "Path to log file to read".into(),
+            read_file_text: default_read_file.to_string_lossy().to_string(),
             output_png_channel: channel(),
-            output_png_file: "seedshot.png".into(),
+            output_png_file: default_screenshot_file.to_string_lossy().to_string(),
             watch_channel: channel(),
             outside_thread_controller: outside_controller,
             inside_thread_controller: inside_controller,
