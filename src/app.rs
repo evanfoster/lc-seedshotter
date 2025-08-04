@@ -1,11 +1,13 @@
 use libscreenshot::WindowCaptureProvider;
 use url::Url;
+use notify;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Result, Watcher};
 use std::io::{BufRead, BufReader, Seek};
 use std::path::{self, Path};
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
+use core::time::Duration;
 
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -233,7 +235,14 @@ fn run_seedshotter(
     let (tx, rx) = channel();
 
     // set up watcher
+    // Windows users get horrible polling because the terrible ReadDirectoryChangesW API REFUSES to
+    // work.
+    #[cfg(target_os = "windows")]
+    let mut watcher = notify::PollWatcher::new(tx.clone(), Config::default().with_poll_interval(Duration::from_millis(10)))?;
+    // let mut watcher = notify::windows::ReadDirectoryChangesWatcher::new(tx.clone(), Config::default())?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let mut watcher = RecommendedWatcher::new(tx.clone(), Config::default())?;
+
     watcher.watch(
         watched_file_path,
         RecursiveMode::NonRecursive,
@@ -257,6 +266,7 @@ fn run_seedshotter(
     for res in rx {
         match res {
             Ok(_event) => {
+                println!("Event: {:?}", _event);
                 if _event.kind == EventKind::Other {
                     println!("Closing seedshotter.");
                     break;
