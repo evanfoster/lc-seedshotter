@@ -22,7 +22,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "LC Seedshotter",
         native_options,
-        Box::new(|cc| Ok(Box::new(lc_seedshotter::TemplateApp::new(cc)))),
+        Box::new(|cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            Ok(Box::new(lc_seedshotter::TemplateApp::new(cc)))
+        }),
     )
 }
 

@@ -1,4 +1,5 @@
 use libscreenshot::WindowCaptureProvider;
+use url::Url;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Result, Watcher};
 use std::io::{BufRead, BufReader, Seek};
 use std::path::{self, Path};
@@ -7,11 +8,6 @@ use std::sync::mpsc::{Sender, channel};
 use std::thread;
 
 use std::sync::{Arc, Condvar, Mutex};
-
-
-
-
-
 
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -27,25 +23,51 @@ pub struct TemplateApp {
     #[serde(skip)]
     watch_channel: (Sender<Result<Event>>, Receiver<Result<Event>>),
     #[serde(skip)]
-    outside_cond_var: Arc<(Mutex<bool>, Condvar)>,
+    outside_thread_controller: Arc<(Mutex<bool>, Condvar)>,
     #[serde(skip)]
-    inside_cond_var: Arc<(Mutex<bool>, Condvar)>,
+    inside_thread_controller: Arc<(Mutex<bool>, Condvar)>,
+    #[serde(skip)]
+    outside_image_regen_marker: Arc<(Mutex<bool>, Condvar)>,
+    #[serde(skip)]
+    inside_image_regen_marker: Arc<(Mutex<bool>, Condvar)>,
+    #[serde(skip)]
+    state: Arc<Mutex<State>>,
+}
+
+struct State {
+    duration: u64,
+    ctx: Option<egui::Context>,
+}
+
+impl State {
+    pub fn new() -> Self {
+        Self {
+            duration: 0,
+            ctx: None,
+        }
+    }
 }
 
 impl Default for TemplateApp {
     fn default() -> Self {
-        let outside = Arc::new((Mutex::new(true), Condvar::new()));
-        let inside = Arc::clone(&outside);
+        let outside_controller = Arc::new((Mutex::new(true), Condvar::new()));
+        let inside_controller = Arc::clone(&outside_controller);
+        let outside_marker = Arc::new((Mutex::new(true), Condvar::new()));
+        let inside_marker = Arc::clone(&outside_marker);
+        let state = Arc::new(Mutex::new(State::new()));
         Self {
             read_file_channel: channel(),
             read_file_text: "Path to log file to read".into(),
             output_png_channel: channel(),
             output_png_file: "seedshot.png".into(),
             watch_channel: channel(),
-            outside_cond_var: outside,
-            inside_cond_var: inside,
+            outside_thread_controller: outside_controller,
+            inside_thread_controller: inside_controller,
+            outside_image_regen_marker: outside_marker,
+            inside_image_regen_marker: inside_marker,
             // Example stuff:
             label: "Hello World!".to_owned(),
+            state,
         }
     }
 }
@@ -61,7 +83,9 @@ impl TemplateApp {
         if let Some(storage) = cc.storage {
             eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
         } else {
-            Default::default()
+            let app:  TemplateApp  = Default::default();
+            app.state.lock().unwrap().ctx = Some(cc.egui_ctx.clone());
+            app
         }
     }
 }
@@ -138,28 +162,51 @@ impl eframe::App for TemplateApp {
             ui.label(format!("Screenshot output file: {}", self.output_png_file));
 
             if ui.button("Start seedshotter").clicked() {
-                let (lock, _cvar) = &*self.outside_cond_var;
+                let (lock, _cvar) = &*self.outside_thread_controller;
                 let mut should_stop = lock.lock().unwrap();
                 *should_stop = false;
                 let watched_file = self.read_file_text.clone();
                 let screenshot_file = self.output_png_file.clone();
-                let inside_cond_var = self.inside_cond_var.clone();
+                let inside_cond_var = self.inside_thread_controller.clone();
+                let inside_image_marker = self.inside_image_regen_marker.clone();
+                let state = Arc::new(Mutex::new(State::new()));
+                state.lock().unwrap().ctx = Some(ctx.clone());
+                self.state = state;
+                let state_clone = self.state.clone();
 
                 thread::spawn(move || {
-                    run_seedshotter(watched_file, screenshot_file, inside_cond_var).unwrap();
+                    run_seedshotter(watched_file, screenshot_file, inside_cond_var, inside_image_marker, state_clone).unwrap();
                 });
             }
             if ui.button("Stop seedshotter").clicked() {
-                let (lock, cvar) = &*self.outside_cond_var;
+                let (lock, cvar) = &*self.outside_thread_controller;
                 let mut should_stop = lock.lock().unwrap();
                 *should_stop = true;
                 cvar.notify_all();
             }
 
-            let (lock, _cvar) = &*self.outside_cond_var;
+            let (lock, _cvar) = &*self.outside_thread_controller;
             let should_stop = lock.lock().unwrap();
             ui.label(format!("Seedshotter running: {}", !*should_stop));
 
+            if Path::new(&self.output_png_file).exists() {
+                let uri = Url::from_file_path(Path::new(&self.output_png_file)).unwrap();
+                let (lock, cvar) = &*self.outside_image_regen_marker;
+                let mut image_regenerated = lock.lock().unwrap();
+                if *image_regenerated {
+                    *image_regenerated = false;
+                    cvar.notify_all();
+                    ui.ctx().forget_image(&*uri.to_string());
+                }
+                ui.add(egui::Image::new(uri.to_string()).shrink_to_fit().corner_radius(5));
+                // ui.add(egui::Image::new(uri.to_string()).shrink_to_fit().corner_radius(5));
+                // ui.image(uri.to_string());
+                // let image = egui::Image::new(uri.to_string()).shrink_to_fit().show_loading_spinner(true);
+                // ui.add(image.);
+                // let loaded_image = ui.ctx().try_load_image(uri.as_str(), egui::SizeHint::default()).unwrap();
+                // ui.image(loaded_image.int);
+
+            }
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 egui::warn_if_debug_build(ui);
             });
@@ -170,7 +217,9 @@ impl eframe::App for TemplateApp {
 fn run_seedshotter(
     watched_file_path_string: String,
     screenshot_file_path_string: String,
-    inside_lock: Arc<(Mutex<bool>, Condvar)>,
+    inside_shutdown_controller: Arc<(Mutex<bool>, Condvar)>,
+    inside_image_marker: Arc<(Mutex<bool>, Condvar)>,
+    state: Arc<Mutex<State>>,
 ) -> Result<()> {
     let provider = libscreenshot::get_window_capture_provider().expect("Unable to find provider");
     // Blatantly ripped from https://stackoverflow.com/a/76815714
@@ -186,26 +235,22 @@ fn run_seedshotter(
     // set up watcher
     let mut watcher = RecommendedWatcher::new(tx.clone(), Config::default())?;
     watcher.watch(
-        watched_file_path.parent().unwrap(),
+        watched_file_path,
         RecursiveMode::NonRecursive,
     )?;
     thread::spawn(move || {
-        loop {
-            let (lock, cvar) = &*inside_lock;
-            let mut should_stop = lock.lock().unwrap();
-            while !*should_stop {
-                should_stop = cvar.wait(should_stop).unwrap();
-            }
-            if !tx.send(Ok(Event::new(EventKind::Other))).is_ok() {
-                println!("Unable to send event");
-                return;
-            }
+        let (lock, cvar) = &*inside_shutdown_controller;
+        let mut should_stop = lock.lock().unwrap();
+        while !*should_stop {
+            should_stop = cvar.wait(should_stop).unwrap();
+        }
+        if !tx.send(Ok(Event::new(EventKind::Other))).is_ok() {
+            println!("Unable to send event");
         }
     });
     println!(
-        "Watching file {} in dir {}",
+        "Watching file {}",
         watched_file_path_string,
-        watched_file_path.parent().unwrap().to_string_lossy()
     );
 
     // watch
@@ -240,6 +285,15 @@ fn run_seedshotter(
                             .save(&screenshot_file_path_string)
                             .expect("Unable to save image");
                         println!("Saving image to {}", screenshot_file_path_string);
+                        let (lock, cvar) = &*inside_image_marker;
+                        let mut image_regenerated = lock.lock()?;
+                        *image_regenerated = true;
+                        cvar.notify_all();
+                        let ctx = &state.lock()?.ctx;
+                        match ctx {
+                            Some(x) => x.request_repaint(),
+                            None => panic!("Error in Option<>"),
+                        }
                     }
                 }
             }
