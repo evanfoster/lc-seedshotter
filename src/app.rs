@@ -1,54 +1,22 @@
 use libscreenshot::WindowCaptureProvider;
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Result, Watcher};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Result, Watcher};
 use std::io::{BufRead, BufReader, Seek};
 use std::path::{self, Path};
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
-#[derive(Clone)]
-pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
-}
 
-impl CancellationToken {
-    #[inline]
-    pub fn should_cancel(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-}
 
-#[derive(Clone)]
-pub struct Canceller {
-    cancelled: Arc<AtomicBool>,
-}
 
-impl Canceller {
-    #[inline]
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-}
 
-#[inline]
-pub fn cancellation_token() -> (Canceller, CancellationToken) {
-    let cancelled = Arc::new(AtomicBool::new(false));
-    (
-        Canceller {
-            cancelled: Arc::clone(&cancelled),
-        },
-        CancellationToken { cancelled },
-    )
-}
 
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)] // if we add new fields, give them default values when deserializing old state
 pub struct TemplateApp {
-    // Example stuff:
     #[serde(skip)]
     read_file_channel: (Sender<String>, Receiver<String>),
     read_file_text: String,
@@ -59,26 +27,25 @@ pub struct TemplateApp {
     #[serde(skip)]
     watch_channel: (Sender<Result<Event>>, Receiver<Result<Event>>),
     #[serde(skip)]
-    cancellation_token: (Canceller, CancellationToken),
-
-    #[serde(skip)] // This how you opt-out of serialization of a field
-    value: f32,
+    outside_cond_var: Arc<(Mutex<bool>, Condvar)>,
+    #[serde(skip)]
+    inside_cond_var: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl Default for TemplateApp {
     fn default() -> Self {
-        let token = cancellation_token();
-        token.0.cancel();
+        let outside = Arc::new((Mutex::new(true), Condvar::new()));
+        let inside = Arc::clone(&outside);
         Self {
             read_file_channel: channel(),
             read_file_text: "Path to log file to read".into(),
             output_png_channel: channel(),
             output_png_file: "seedshot.png".into(),
             watch_channel: channel(),
-            cancellation_token: token,
+            outside_cond_var: outside,
+            inside_cond_var: inside,
             // Example stuff:
             label: "Hello World!".to_owned(),
-            value: 2.7,
         }
     }
 }
@@ -171,20 +138,27 @@ impl eframe::App for TemplateApp {
             ui.label(format!("Screenshot output file: {}", self.output_png_file));
 
             if ui.button("Start seedshotter").clicked() {
-                self.cancellation_token = cancellation_token();
+                let (lock, _cvar) = &*self.outside_cond_var;
+                let mut should_stop = lock.lock().unwrap();
+                *should_stop = false;
                 let watched_file = self.read_file_text.clone();
                 let screenshot_file = self.output_png_file.clone();
-                let token = self.cancellation_token.1.clone();
+                let inside_cond_var = self.inside_cond_var.clone();
+
                 thread::spawn(move || {
-                    run_seedshotter(watched_file, screenshot_file, token).unwrap();
+                    run_seedshotter(watched_file, screenshot_file, inside_cond_var).unwrap();
                 });
             }
             if ui.button("Stop seedshotter").clicked() {
-                self.cancellation_token.0.cancel();
+                let (lock, cvar) = &*self.outside_cond_var;
+                let mut should_stop = lock.lock().unwrap();
+                *should_stop = true;
+                cvar.notify_all();
             }
 
-            ui.label(format!("Seedshotter running: {}", !self.cancellation_token.1.should_cancel()));
-
+            let (lock, _cvar) = &*self.outside_cond_var;
+            let should_stop = lock.lock().unwrap();
+            ui.label(format!("Seedshotter running: {}", !*should_stop));
 
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 egui::warn_if_debug_build(ui);
@@ -193,15 +167,13 @@ impl eframe::App for TemplateApp {
     }
 }
 
-
 fn run_seedshotter(
     watched_file_path_string: String,
     screenshot_file_path_string: String,
-    cancellation_token: CancellationToken,
+    inside_lock: Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<()> {
     let provider = libscreenshot::get_window_capture_provider().expect("Unable to find provider");
     // Blatantly ripped from https://stackoverflow.com/a/76815714
-    // get file
 
     // get pos to end of file
     let watched_file_path = Path::new(&watched_file_path_string);
@@ -209,14 +181,27 @@ fn run_seedshotter(
 
     let mut f = std::fs::File::open(watched_file_path)?;
     let mut pos = std::fs::metadata(watched_file_path)?.len();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = channel();
 
     // set up watcher
-    let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
+    let mut watcher = RecommendedWatcher::new(tx.clone(), Config::default())?;
     watcher.watch(
         watched_file_path.parent().unwrap(),
         RecursiveMode::NonRecursive,
     )?;
+    thread::spawn(move || {
+        loop {
+            let (lock, cvar) = &*inside_lock;
+            let mut should_stop = lock.lock().unwrap();
+            while !*should_stop {
+                should_stop = cvar.wait(should_stop).unwrap();
+            }
+            if !tx.send(Ok(Event::new(EventKind::Other))).is_ok() {
+                println!("Unable to send event");
+                return;
+            }
+        }
+    });
     println!(
         "Watching file {} in dir {}",
         watched_file_path_string,
@@ -225,12 +210,12 @@ fn run_seedshotter(
 
     // watch
     for res in rx {
-        if cancellation_token.should_cancel() {
-            println!("Watching thread exiting");
-            return Ok(());
-        }
         match res {
             Ok(_event) => {
+                if _event.kind == EventKind::Other {
+                    println!("Closing seedshotter.");
+                    break;
+                }
                 if path::absolute(_event.paths[0].clone())? != absolute_file_path {
                     continue;
                 }
